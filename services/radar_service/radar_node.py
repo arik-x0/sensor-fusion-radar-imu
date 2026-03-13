@@ -1,37 +1,56 @@
 """
-Radar Simulator Service
-=======================
-Simulates a target moving through 3D space and publishes noisy radar
-measurements (range, azimuth, elevation, Doppler) at a configurable rate.
+Radar Service
+=============
+Simulates a ground-based surveillance radar that tracks the rover published
+by the rover_service.  The radar is fixed at the world-frame origin (0, 0, 0).
 
-Publishes to the broker XSUB port so that all subscribers (buffer service,
-monitors) receive measurements through the central broker.
+For each RoverTruth message received the service:
+  1. Converts the rover's Cartesian position and velocity to spherical
+     coordinates (range, azimuth, elevation, Doppler).
+  2. Adds realistic Gaussian measurement noise.
+  3. Rate-limits publication to RADAR_HZ (default 10 Hz) using a wall-clock
+     gate — the rover_service publishes much faster (200 Hz), so most
+     truth messages are consumed but silently dropped.
+
+Radar model
+-----------
+  - Monostatic, ground-fixed at origin.
+  - Measures: range (m), azimuth (rad), elevation (rad), Doppler (m/s).
+  - Doppler sign convention: positive = target approaching.
+  - The rover is a passive, cooperative target (no transponder needed for
+    the radar measurement itself, but the rover_service does publish truth).
 
 Environment variables
 ---------------------
-BROKER_XSUB_ADDR     ZMQ connect address for broker XSUB  (default tcp://broker_service:5550)
-RADAR_HZ             Publication rate  (default 10)
-RADAR_NOISE_RANGE    Std-dev of range noise in metres   (default 1.5)
-RADAR_NOISE_ANGLE    Std-dev of angle noise in radians  (default 0.01)
-RADAR_NOISE_DOPPLER  Std-dev of Doppler noise in m/s    (default 0.5)
+BROKER_XPUB_ADDR     ZMQ address to subscribe to (broker XPUB, default tcp://broker_service:5551)
+BROKER_XSUB_ADDR     ZMQ address to publish to   (broker XSUB, default tcp://broker_service:5550)
+RADAR_HZ             Measurement publication rate (default 10)
+RADAR_NOISE_RANGE    Range noise std-dev (m)       (default 1.5)
+RADAR_NOISE_ANGLE    Angle noise std-dev (rad)     (default 0.01)
+RADAR_NOISE_DOPPLER  Doppler noise std-dev (m/s)   (default 0.5)
 """
 
-import os
+from __future__ import annotations
+
 import math
+import os
 import time
-import numpy as np
 import logging
 
-from common.models import RadarMeasurement
-from common.transport import Publisher
-from common.topics import TOPIC_RADAR
+import numpy as np
+import zmq
 
-# ── configuration ──────────────────────────────────────────────────────────
-BROKER_XSUB_ADDR = os.getenv("BROKER_XSUB_ADDR",    "tcp://broker_service:5550")
-HZ               = float(os.getenv("RADAR_HZ",           "10"))
-NOISE_RANGE      = float(os.getenv("RADAR_NOISE_RANGE",  "1.5"))
-NOISE_ANGLE      = float(os.getenv("RADAR_NOISE_ANGLE",  "0.01"))
-NOISE_DOPPLER    = float(os.getenv("RADAR_NOISE_DOPPLER","0.5"))
+from common.models import RoverTruth, RadarMeasurement
+from common.topics import TOPIC_ROVER_TRUTH, TOPIC_RADAR
+from common.transport import Publisher, Subscriber
+
+# ── configuration ─────────────────────────────────────────────────────────────
+BROKER_XPUB_ADDR = os.getenv("BROKER_XPUB_ADDR", "tcp://broker_service:5551")
+BROKER_XSUB_ADDR = os.getenv("BROKER_XSUB_ADDR", "tcp://broker_service:5550")
+HZ               = float(os.getenv("RADAR_HZ",            "10"))
+NOISE_RANGE      = float(os.getenv("RADAR_NOISE_RANGE",   "1.5"))
+NOISE_ANGLE      = float(os.getenv("RADAR_NOISE_ANGLE",   "0.01"))
+NOISE_DOPPLER    = float(os.getenv("RADAR_NOISE_DOPPLER", "0.5"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,57 +60,69 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── simulated target dynamics ───────────────────────────────────────────────
-class TargetSimulator:
-    """Simple constant-velocity target in 3-D space."""
+def _to_spherical(
+    pos: np.ndarray, vel: np.ndarray
+) -> tuple[float, float, float, float]:
+    """Convert Cartesian position/velocity to (range, azimuth, elevation, doppler).
 
-    def __init__(self):
-        # initial position (m) and velocity (m/s)
-        self.pos = np.array([100.0, 50.0, 20.0])
-        self.vel = np.array([-3.0,  1.5, -0.5])
-
-    def step(self, dt: float) -> tuple[np.ndarray, np.ndarray]:
-        """Advance simulation by *dt* seconds; return (position, velocity)."""
-        self.pos = self.pos + self.vel * dt
-        return self.pos.copy(), self.vel.copy()
-
-
-def cartesian_to_spherical(pos: np.ndarray, vel: np.ndarray):
-    """Convert Cartesian position/velocity to (range, azimuth, elevation, doppler)."""
-    r = np.linalg.norm(pos)
+    The radar is at the origin.  Doppler is positive when the target
+    approaches (radial velocity toward the radar).
+    """
+    r = float(np.linalg.norm(pos))
     if r < 1e-6:
         return 0.0, 0.0, 0.0, 0.0
-    az  = math.atan2(pos[1], pos[0])                    # radians
-    el  = math.asin(np.clip(pos[2] / r, -1.0, 1.0))    # radians
-    # Radial velocity (positive = approaching → negate the dot product)
+    az      = math.atan2(pos[1], pos[0])
+    el      = math.asin(float(np.clip(pos[2] / r, -1.0, 1.0)))
     unit_r  = pos / r
-    doppler = -float(np.dot(vel, unit_r))               # m/s
-    return float(r), float(az), float(el), float(doppler)
+    doppler = -float(np.dot(vel, unit_r))   # positive = approaching
+    return r, az, el, doppler
 
 
-# ── main ────────────────────────────────────────────────────────────────────
-def main():
-    rng    = np.random.default_rng()
-    target = TargetSimulator()
-    dt     = 1.0 / HZ
+def main() -> None:
+    rng      = np.random.default_rng()
+    min_dt   = 1.0 / HZ
+    last_pub = 0.0
 
-    log.info("Connecting publisher to broker %s at %.1f Hz", BROKER_XSUB_ADDR, HZ)
+    log.info("Subscribing to rover truth on %s", BROKER_XPUB_ADDR)
+    log.info("Publishing radar measurements to %s at %.1f Hz", BROKER_XSUB_ADDR, HZ)
+
+    sub = Subscriber(
+        addresses=[BROKER_XPUB_ADDR],
+        topics=[TOPIC_ROVER_TRUTH],
+        recv_timeout_ms=2000,
+    )
 
     with Publisher(BROKER_XSUB_ADDR) as pub:
         while True:
-            t0 = time.monotonic()
+            try:
+                _, payload = sub.recv()
+                truth = RoverTruth.from_bytes(payload)
+            except zmq.Again:
+                log.warning("No rover truth received within timeout — waiting…")
+                continue
+            except Exception as exc:
+                log.error("Receive error: %s", exc)
+                continue
 
-            pos, vel = target.step(dt)
-            r, az, el, dp = cartesian_to_spherical(pos, vel)
+            # Rate-gate: only publish at RADAR_HZ regardless of truth rate
+            now = time.time()
+            if now - last_pub < min_dt:
+                continue
+            last_pub = now
 
-            # add measurement noise
+            pos = np.array([truth.pos_x, truth.pos_y, truth.pos_z])
+            vel = np.array([truth.vel_x, truth.vel_y, truth.vel_z])
+
+            r, az, el, dp = _to_spherical(pos, vel)
+
+            # Add measurement noise
             r  += rng.normal(0.0, NOISE_RANGE)
             az += rng.normal(0.0, NOISE_ANGLE)
             el += rng.normal(0.0, NOISE_ANGLE)
             dp += rng.normal(0.0, NOISE_DOPPLER)
 
             meas = RadarMeasurement(
-                timestamp=time.time(),
+                timestamp=truth.timestamp,
                 range=max(0.0, r),
                 azimuth=az,
                 elevation=el,
@@ -102,9 +133,6 @@ def main():
                 "r=%.2f m  az=%.3f rad  el=%.3f rad  dp=%.2f m/s",
                 meas.range, meas.azimuth, meas.elevation, meas.doppler,
             )
-
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, dt - elapsed))
 
 
 if __name__ == "__main__":
