@@ -12,7 +12,26 @@ services:
     networks:
       - sensor_net
 
-  # ── Radar Simulator ────────────────────────────────────────────────────────
+  # ── Rover Service (shared ground truth — start before radar and imu) ────────
+  rover_service:
+    build:
+      context: .
+      dockerfile: services/rover_service/Dockerfile
+    container_name: rover_service
+    depends_on:
+      - broker_service
+    environment:
+      BROKER_XSUB_ADDR: "tcp://broker_service:5550"
+      ROVER_HZ: "${ROVER_HZ:-200}"
+      ORBIT_RADIUS: "${ORBIT_RADIUS:-150}"
+      ORBIT_OMEGA: "${ORBIT_OMEGA:-0.15}"
+      ROVER_ALTITUDE: "${ROVER_ALTITUDE:-80}"
+      ROVER_ALT_AMP: "${ROVER_ALT_AMP:-20}"
+      ROVER_ALT_OMEGA: "${ROVER_ALT_OMEGA:-0.05}"
+    networks:
+      - sensor_net
+
+  # ── Radar Service (derives measurements from rover truth) ─────────────────
   radar_service:
     build:
       context: .
@@ -20,7 +39,9 @@ services:
     container_name: radar_service
     depends_on:
       - broker_service
+      - rover_service
     environment:
+      BROKER_XPUB_ADDR: "tcp://broker_service:5551"
       BROKER_XSUB_ADDR: "tcp://broker_service:5550"
       RADAR_HZ: "${RADAR_HZ:-10}"
       RADAR_NOISE_RANGE: "${RADAR_NOISE_RANGE:-1.5}"
@@ -29,7 +50,7 @@ services:
     networks:
       - sensor_net
 
-  # ── IMU Simulator ──────────────────────────────────────────────────────────
+  # ── IMU Service (derives measurements from rover truth) ───────────────────
   imu_service:
     build:
       context: .
@@ -37,7 +58,9 @@ services:
     container_name: imu_service
     depends_on:
       - broker_service
+      - rover_service
     environment:
+      BROKER_XPUB_ADDR: "tcp://broker_service:5551"
       BROKER_XSUB_ADDR: "tcp://broker_service:5550"
       IMU_HZ: "${IMU_HZ:-100}"
       IMU_NOISE_ACCEL: "${IMU_NOISE_ACCEL:-0.05}"

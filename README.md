@@ -12,28 +12,47 @@ XSUB/XPUB sockets. A dedicated **buffer service** sits between the raw sensors
 and the EKF to synchronize the two streams and detect late-arriving messages.
 
 ```
-┌─────────────────┐                                      ┌──────────────────────┐
-│  radar_service  │──PUB (topic: radar)──▶┐              │   monitor_service    │
-│  10 Hz          │                       │              │   prints state       │
-└─────────────────┘                       ▼              └──────────▲───────────┘
-                                  ┌───────────────┐                 │
-┌─────────────────┐               │               │                 │
-│  imu_service    │──PUB (imu)──▶ │ broker_service│──XPUB──▶────────┤
-│  100 Hz         │               │  XSUB / XPUB  │                 │
-└─────────────────┘               │  ROUTER       │            ┌────┴──────────────────┐
-                                  └───────────────┘            │    ekf_service        │
-                                          │                    │                       │
-                                    XPUB  │                    │  predict()  (IMU)     │
-                                          ▼                    │  update()   (Radar)   │
-                                  ┌───────────────┐            │  backprop on late     │
-                                  │ buffer_service│──buffer──▶ │  messages             │
-                                  │  sync + order │            └───────────┬───────────┘
-                                  │  late detect  │                        │ PUB (state)
-                                  └───────────────┘                        ▼
-                                                               ┌──────────────────────┐
-                                                               │  visualizer_service  │
-                                                               │  live 3-D plot       │
-                                                               └──────────────────────┘
+                        ┌──────────────────────┐
+                        │    rover_service      │  ← single source of truth
+                        │  circular orbit       │    for the simulated rover
+                        │  200 Hz               │
+                        └──────┬────────────────┘
+               PUB (rover_truth)│
+                                ▼
+                        ┌───────────────┐
+                        │ broker_service│
+                        │  XSUB / XPUB  │
+                        │  ROUTER       │
+                        └───────┬───────┘
+             XPUB               │
+        ┌────────────┬──────────┘
+        ▼            ▼
+┌────────────┐  ┌────────────┐
+│radar_service│  │ imu_service│    Both derive noisy measurements
+│ 10 Hz      │  │  100 Hz    │    from the same rover_truth stream.
+│ ground-    │  │ rover-     │    Radar = ground-fixed monostatic.
+│ fixed radar│  │ board IMU  │    IMU   = onboard the rover.
+└─────┬──────┘  └──────┬─────┘
+      │PUB(radar)       │PUB(imu)
+      └────────┬────────┘
+               ▼
+       ┌───────────────┐                        ┌──────────────────────┐
+       │ broker_service│──XPUB──▶───────────────▶   monitor_service    │
+       └───────┬───────┘                        │   prints state       │
+         XPUB  │                                └──────────▲───────────┘
+               ▼                                           │
+       ┌───────────────┐                       ┌───────────┴───────────┐
+       │ buffer_service│──buffer──▶────────────▶    ekf_service        │
+       │  sync + order │                       │  predict()  (IMU)     │
+       │  late detect  │                       │  update()   (Radar)   │
+       └───────────────┘                       │  backprop on late     │
+                                               └───────────┬───────────┘
+                                                           │ PUB (state)
+                                                           ▼
+                                               ┌──────────────────────┐
+                                               │  visualizer_service  │
+                                               │  live 3-D plot       │
+                                               └──────────────────────┘
 ```
 
 ### Services
@@ -41,8 +60,9 @@ and the EKF to synchronize the two streams and detect late-arriving messages.
 | Service | Role |
 |---|---|
 | `broker_service` | Central message router (XSUB/XPUB/ROUTER). All publishers and subscribers connect through it. |
-| `radar_service` | Simulates target radar returns — publishes `RadarMeasurement` at 10 Hz |
-| `imu_service` | Simulates body-frame IMU — publishes `ImuMeasurement` at 100 Hz |
+| `rover_service` | **Single source of truth** — simulates a rover flying a circular orbit; publishes `RoverTruth` at 200 Hz |
+| `radar_service` | Ground-fixed monostatic radar — subscribes to `RoverTruth`, produces noisy spherical measurements at 10 Hz |
+| `imu_service` | Rover-onboard IMU — subscribes to `RoverTruth`, produces noisy body-frame accel + gyro at 100 Hz |
 | `buffer_service` | Buffers and time-orders both sensor streams; flags late messages for backpropagation |
 | `ekf_service` | **Main service** — runs EKF predict/update, publishes `EkfState`; performs backpropagation on late data |
 | `monitor_service` | Subscribes to EKF state, pretty-prints position/velocity/attitude and covariance trace |
@@ -68,13 +88,15 @@ and the EKF to synchronize the two streams and detect late-arriving messages.
 
 ## Message Flow
 
-1. **radar_service** and **imu_service** publish raw measurements to the broker.
-2. **buffer_service** subscribes to both topics, holds messages in a min-heap sorted by timestamp, and flushes them every `BUFFER_WINDOW_MS` in strict timestamp order as `BufferEntry` packets on the `buffer` topic.
-3. If a message arrives after messages with a later timestamp have already been released, `BufferEntry.is_late` is set to `True`.
-4. **ekf_service** subscribes only to `TOPIC_BUFFER`. It dispatches each entry to `ekf.predict()` (IMU) or `ekf.update()` (radar) and publishes the fused `EkfState` after every radar update.
-5. On `is_late=True`, the EKF rewinds to the stored state snapshot just before the late measurement's timestamp, inserts the late measurement, and replays all subsequent measurements from its internal history buffer (backpropagation).
-6. **monitor_service** subscribes to the fused state and pretty-prints it to stdout.
-7. **visualizer_service** (optional, local only) subscribes to the same state topic and renders a live 3-D matplotlib trajectory plot.
+1. **rover_service** publishes the rover's true kinematic state (`RoverTruth`) at 200 Hz — position, velocity, world-frame acceleration, orientation quaternion, and angular rate.
+2. **radar_service** subscribes to `RoverTruth`, converts the rover's Cartesian position and velocity to spherical coordinates (range, azimuth, elevation, Doppler), adds Gaussian noise, and publishes `RadarMeasurement` at 10 Hz. The radar is fixed at the world-frame origin.
+3. **imu_service** subscribes to `RoverTruth`, rotates the rover's world-frame acceleration into the rover's body frame, adds Gaussian noise, and publishes `ImuMeasurement` at 100 Hz. Both sensors always observe the same rover.
+4. **buffer_service** subscribes to both topics, holds messages in a min-heap sorted by timestamp, and flushes them every `BUFFER_WINDOW_MS` in strict timestamp order as `BufferEntry` packets on the `buffer` topic.
+5. If a message arrives after messages with a later timestamp have already been released, `BufferEntry.is_late` is set to `True`.
+6. **ekf_service** subscribes only to `TOPIC_BUFFER`. It dispatches each entry to `ekf.predict()` (IMU) or `ekf.update()` (radar) and publishes the fused `EkfState` after every radar update.
+7. On `is_late=True`, the EKF rewinds to the stored state snapshot just before the late measurement's timestamp, inserts the late measurement, and replays all subsequent measurements from its internal history buffer (backpropagation).
+8. **monitor_service** subscribes to the fused state and pretty-prints it to stdout.
+9. **visualizer_service** (optional, local only) subscribes to the same state topic and renders a live 3-D matplotlib trajectory plot.
 
 ---
 
@@ -111,20 +133,23 @@ export PYTHONPATH=.       # Linux/macOS
 # 1 — Broker (must start first)
 python services/broker/broker_server.py
 
-# 2 — Sensors (order does not matter)
+# 2 — Rover simulator (must start before radar and imu)
+python services/rover_service/rover_node.py
+
+# 3 — Sensors (subscribe to rover truth — start after rover_service)
 python services/radar_service/radar_node.py
 python services/imu_service/imu_node.py
 
-# 3 — Buffer (after sensors are up)
+# 4 — Buffer (after sensors are up)
 python services/buffer_service/buffer_node.py
 
-# 4 — EKF (after buffer is up)
+# 5 — EKF (after buffer is up)
 python services/ekf_service/ekf_node.py
 
-# 5 — Monitor
+# 6 — Monitor
 python services/monitor_service/monitor_node.py
 
-# 6 — 3-D Visualizer (optional, local only — opens a matplotlib window)
+# 7 — 3-D Visualizer (optional, local only — opens a matplotlib window)
 python services/visualizer_service/visualizer_node.py
 ```
 
@@ -143,6 +168,12 @@ All parameters are controlled via environment variables (see `.env`).
 
 | Variable | Default | Description |
 |---|---|---|
+| `ROVER_HZ` | `200` | Rover truth publication rate (Hz) |
+| `ORBIT_RADIUS` | `150` | Rover orbit radius (m) |
+| `ORBIT_OMEGA` | `0.15` | Rover orbital angular velocity (rad/s) — one orbit ≈ 42 s |
+| `ROVER_ALTITUDE` | `80` | Base altitude of the orbit (m) |
+| `ROVER_ALT_AMP` | `20` | Altitude oscillation amplitude (m) |
+| `ROVER_ALT_OMEGA` | `0.05` | Altitude oscillation frequency (rad/s) |
 | `RADAR_HZ` | `10` | Radar publication rate (Hz) |
 | `RADAR_NOISE_RANGE` | `1.5` | Range noise std-dev (m) |
 | `RADAR_NOISE_ANGLE` | `0.01` | Azimuth/elevation noise std-dev (rad) |
@@ -180,7 +211,7 @@ Tests cover:
 ```
 sensor-fusion-radar-imu/
 ├── common/                        # Shared package (all services import this)
-│   ├── models.py                  # ImuMeasurement, RadarMeasurement, EkfState, BufferEntry
+│   ├── models.py                  # RoverTruth, ImuMeasurement, RadarMeasurement, EkfState, BufferEntry
 │   ├── transport.py               # ZeroMQ Publisher / Subscriber / Requester / Replier
 │   └── topics.py                  # Topic name constants
 │
@@ -190,13 +221,18 @@ sensor-fusion-radar-imu/
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   │
+│   ├── rover_service/                             # ← single source of truth for the rover
+│   │   ├── rover_node.py                          # Analytic circular orbit — publishes RoverTruth at 200 Hz
+│   │   ├── Dockerfile
+│   │   └── requirements.txt
+│   │
 │   ├── radar_service/
-│   │   ├── radar_node.py          # Radar simulator — publishes to broker
+│   │   ├── radar_node.py          # Ground radar — subscribes to RoverTruth, publishes RadarMeasurement
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   │
 │   ├── imu_service/
-│   │   ├── imu_node.py            # IMU simulator — publishes to broker
+│   │   ├── imu_node.py            # Rover-onboard IMU — subscribes to RoverTruth, publishes ImuMeasurement
 │   │   ├── Dockerfile
 │   │   └── requirements.txt
 │   │
