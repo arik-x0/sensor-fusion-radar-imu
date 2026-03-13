@@ -1,8 +1,16 @@
 """
 Visualizer Service
 ==================
-Subscribes to the EKF state topic and renders a live 3-D matplotlib plot
-of the fused position trajectory.
+Subscribes to both TOPIC_ROVER_TRUTH (ground truth) and TOPIC_STATE (EKF
+estimate) and renders a live 3-D matplotlib plot overlaying both trajectories
+so you can directly compare how closely the EKF tracks the real rover.
+
+  Green  = rover_service ground truth  (where the rover actually is)
+  Blue   = EKF estimate               (what the system thinks)
+  Orange = current velocity vector of the EKF estimate
+
+The info box shows the real-time position error (Euclidean distance between
+truth and estimate) so you can watch the filter converge.
 
 Designed to run locally — requires a graphical display.
 Not suitable for headless Docker without X11 forwarding / Xvfb.
@@ -10,15 +18,17 @@ Not suitable for headless Docker without X11 forwarding / Xvfb.
 Environment variables
 ---------------------
 BROKER_XPUB_ADDR   ZMQ connect address for broker XPUB  (default tcp://localhost:5551)
-VIZ_HISTORY        Number of past positions kept in the trail  (default 500)
-VIZ_UPDATE_MS      Plot refresh interval in milliseconds       (default 100)
+VIZ_HISTORY        Number of past positions kept in each trail  (default 500)
+VIZ_UPDATE_MS      Plot refresh interval in milliseconds        (default 100)
 """
 
 from __future__ import annotations
 
 import collections
+import math
 import os
 import threading
+from dataclasses import dataclass
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
@@ -26,8 +36,8 @@ import numpy as np
 import zmq
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers the 3-D projection
 
-from common.models import EkfState
-from common.topics import TOPIC_STATE
+from common.models import RoverTruth, EkfState
+from common.topics import TOPIC_ROVER_TRUTH, TOPIC_STATE
 from common.transport import Subscriber
 
 BROKER_XPUB_ADDR = os.getenv("BROKER_XPUB_ADDR", "tcp://localhost:5551")
@@ -35,140 +45,209 @@ VIZ_HISTORY      = int(os.getenv("VIZ_HISTORY",    "500"))
 VIZ_UPDATE_MS    = int(os.getenv("VIZ_UPDATE_MS",  "100"))
 
 
-# ── Thread-safe state buffer ──────────────────────────────────────────────────
+# ── Thread-safe ring buffers ──────────────────────────────────────────────────
 
-class _StateBuffer:
-    """Ring buffer of EkfState objects shared between the subscriber thread and
-    the matplotlib animation callback."""
+@dataclass
+class _Point3:
+    x: float
+    y: float
+    z: float
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+    cov_trace: float = 0.0
 
+
+class _TrailBuffer:
     def __init__(self, maxlen: int) -> None:
         self._lock   = threading.Lock()
-        self._states: collections.deque[EkfState] = collections.deque(maxlen=maxlen)
+        self._trail: collections.deque[_Point3] = collections.deque(maxlen=maxlen)
 
-    def push(self, state: EkfState) -> None:
+    def push(self, pt: _Point3) -> None:
         with self._lock:
-            self._states.append(state)
+            self._trail.append(pt)
 
-    def snapshot(self) -> list[EkfState]:
-        """Return a shallow copy of current contents (safe to iterate off-thread)."""
+    def snapshot(self) -> list[_Point3]:
         with self._lock:
-            return list(self._states)
+            return list(self._trail)
 
 
 # ── Subscriber thread ─────────────────────────────────────────────────────────
 
-def _subscriber_thread(buf: _StateBuffer) -> None:
+def _subscriber_thread(truth_buf: _TrailBuffer, ekf_buf: _TrailBuffer) -> None:
     sub = Subscriber(
         addresses=[BROKER_XPUB_ADDR],
-        topics=[TOPIC_STATE],
+        topics=[TOPIC_ROVER_TRUTH, TOPIC_STATE],
         recv_timeout_ms=2000,
     )
     while True:
         try:
-            _, payload = sub.recv()
-            buf.push(EkfState.from_bytes(payload))
+            topic, payload = sub.recv()
+            if topic == TOPIC_ROVER_TRUTH:
+                t = RoverTruth.from_bytes(payload)
+                truth_buf.push(_Point3(
+                    x=t.pos_x, y=t.pos_y, z=t.pos_z,
+                    vx=t.vel_x, vy=t.vel_y, vz=t.vel_z,
+                ))
+            elif topic == TOPIC_STATE:
+                s = EkfState.from_bytes(payload)
+                cov = float(np.trace(np.array(s.covariance).reshape(10, 10)))
+                ekf_buf.push(_Point3(
+                    x=s.pos_x, y=s.pos_y, z=s.pos_z,
+                    vx=s.vel_x, vy=s.vel_y, vz=s.vel_z,
+                    cov_trace=cov,
+                ))
         except zmq.Again:
             pass
         except Exception:
             pass
 
 
-# ── Matplotlib live plot ──────────────────────────────────────────────────────
+# ── Plot ──────────────────────────────────────────────────────────────────────
 
-def _build_figure():
-    """Create and return (fig, ax, artists) for the 3-D trajectory plot."""
-    fig = plt.figure(figsize=(11, 8))
-    fig.suptitle("EKF 3-D Position Trajectory", fontsize=13, fontweight="bold")
+def main() -> None:
+    truth_buf = _TrailBuffer(maxlen=VIZ_HISTORY)
+    ekf_buf   = _TrailBuffer(maxlen=VIZ_HISTORY)
+
+    threading.Thread(
+        target=_subscriber_thread,
+        args=(truth_buf, ekf_buf),
+        daemon=True,
+        name="viz-sub",
+    ).start()
+
+    fig = plt.figure(figsize=(13, 9))
+    fig.suptitle(
+        "Drone Tracking — Ground Truth vs EKF Estimate",
+        fontsize=14, fontweight="bold",
+    )
 
     ax = fig.add_subplot(111, projection="3d")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
 
-    # Trail line — full history
-    (trail_line,) = ax.plot([], [], [], "-", color="steelblue", lw=1.5,
-                            alpha=0.65, label="Trajectory")
+    # ── Ground truth artists (green) ─────────────────────────────────────────
+    (truth_trail,) = ax.plot([], [], [], "-",
+                             color="limegreen", lw=1.5, alpha=0.7,
+                             label="True trajectory")
+    (truth_dot,)   = ax.plot([], [], [], "^",
+                             color="darkgreen", ms=9,
+                             label="True position")
 
-    # Current position marker
-    (current_dot,) = ax.plot([], [], [], "o", color="crimson", ms=9,
-                             label="Current position")
+    # ── EKF estimate artists (blue) ───────────────────────────────────────────
+    (ekf_trail,)   = ax.plot([], [], [], "-",
+                             color="steelblue", lw=1.5, alpha=0.7,
+                             label="EKF estimate")
+    (ekf_dot,)     = ax.plot([], [], [], "o",
+                             color="crimson", ms=9,
+                             label="EKF position")
 
-    # Velocity vector (quiver) — updated each frame; stored in a list so the
-    # closure can replace the artist without a nonlocal statement.
-    vel_quiver: list = [None]
+    # EKF velocity arrow — replaced each frame
+    ekf_quiver: list = [None]
 
-    # Info text box (2-D overlay in axes coordinates)
+    # Error line connecting truth to estimate at current moment
+    (error_line,)  = ax.plot([], [], [], "--",
+                             color="gold", lw=1.5, alpha=0.9,
+                             label="Position error")
+
+    # Info overlay
     info_text = ax.text2D(
         0.02, 0.97, "",
         transform=ax.transAxes,
         fontsize=8,
         verticalalignment="top",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow",
-                  edgecolor="gray", alpha=0.85),
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="black",
+                  edgecolor="gray", alpha=0.75),
+        color="white",
     )
 
     ax.legend(loc="upper right", fontsize=8)
 
-    return fig, ax, trail_line, current_dot, vel_quiver, info_text
-
-
-def main():
-    buf = _StateBuffer(maxlen=VIZ_HISTORY)
-
-    # Start the subscriber on a daemon thread so it doesn't block on exit.
-    threading.Thread(
-        target=_subscriber_thread,
-        args=(buf,),
-        daemon=True,
-        name="ekf-sub",
-    ).start()
-
-    fig, ax, trail_line, current_dot, vel_quiver, info_text = _build_figure()
-
     def _update(_frame):
-        states = buf.snapshot()
-        if not states:
-            return trail_line, current_dot, info_text
+        truths = truth_buf.snapshot()
+        ekfs   = ekf_buf.snapshot()
 
-        xs = np.array([s.pos_x for s in states])
-        ys = np.array([s.pos_y for s in states])
-        zs = np.array([s.pos_z for s in states])
+        if not truths and not ekfs:
+            return truth_trail, truth_dot, ekf_trail, ekf_dot, error_line, info_text
 
-        # ── Trail ──────────────────────────────────────────────────────────
-        trail_line.set_data(xs, ys)
-        trail_line.set_3d_properties(zs)
+        # ── Truth trail ───────────────────────────────────────────────────────
+        if truths:
+            txs = np.array([p.x for p in truths])
+            tys = np.array([p.y for p in truths])
+            tzs = np.array([p.z for p in truths])
+            truth_trail.set_data(txs, tys)
+            truth_trail.set_3d_properties(tzs)
+            truth_dot.set_data([txs[-1]], [tys[-1]])
+            truth_dot.set_3d_properties([tzs[-1]])
 
-        # ── Current position ────────────────────────────────────────────────
-        current_dot.set_data([xs[-1]], [ys[-1]])
-        current_dot.set_3d_properties([zs[-1]])
+        # ── EKF trail ─────────────────────────────────────────────────────────
+        if ekfs:
+            exs = np.array([p.x for p in ekfs])
+            eys = np.array([p.y for p in ekfs])
+            ezs = np.array([p.z for p in ekfs])
+            ekf_trail.set_data(exs, eys)
+            ekf_trail.set_3d_properties(ezs)
+            ekf_dot.set_data([exs[-1]], [eys[-1]])
+            ekf_dot.set_3d_properties([ezs[-1]])
 
-        # ── Velocity arrow (remove previous, then redraw) ───────────────────
-        if vel_quiver[0] is not None:
-            vel_quiver[0].remove()
-        last = states[-1]
-        vel_quiver[0] = ax.quiver(
-            last.pos_x, last.pos_y, last.pos_z,
-            last.vel_x, last.vel_y, last.vel_z,
-            color="darkorange", linewidth=2, arrow_length_ratio=0.3,
-        )
+            # Velocity arrow
+            if ekf_quiver[0] is not None:
+                ekf_quiver[0].remove()
+            last_ekf = ekfs[-1]
+            ekf_quiver[0] = ax.quiver(
+                last_ekf.x, last_ekf.y, last_ekf.z,
+                last_ekf.vx, last_ekf.vy, last_ekf.vz,
+                color="darkorange", linewidth=2, arrow_length_ratio=0.3,
+            )
 
-        # ── Axis limits with padding ────────────────────────────────────────
-        pad = max(2.0, (xs.ptp() + ys.ptp() + zs.ptp()) * 0.1)
-        ax.set_xlim(xs.min() - pad, xs.max() + pad)
-        ax.set_ylim(ys.min() - pad, ys.max() + pad)
-        ax.set_zlim(zs.min() - pad, zs.max() + pad)
+        # ── Error line between current truth and current estimate ─────────────
+        pos_error_m = float("nan")
+        if truths and ekfs:
+            t_last = truths[-1]
+            e_last = ekfs[-1]
+            error_line.set_data([t_last.x, e_last.x], [t_last.y, e_last.y])
+            error_line.set_3d_properties([t_last.z, e_last.z])
+            pos_error_m = math.sqrt(
+                (t_last.x - e_last.x) ** 2 +
+                (t_last.y - e_last.y) ** 2 +
+                (t_last.z - e_last.z) ** 2
+            )
 
-        # ── Info overlay ────────────────────────────────────────────────────
-        cov_trace = float(np.trace(np.array(last.covariance).reshape(10, 10)))
+        # ── Axis limits — fit both trails ─────────────────────────────────────
+        all_x = (
+            [p.x for p in truths] + [p.x for p in ekfs]
+        ) or [0.0]
+        all_y = (
+            [p.y for p in truths] + [p.y for p in ekfs]
+        ) or [0.0]
+        all_z = (
+            [p.z for p in truths] + [p.z for p in ekfs]
+        ) or [0.0]
+        pad = max(5.0, (max(all_x) - min(all_x) +
+                        max(all_y) - min(all_y) +
+                        max(all_z) - min(all_z)) * 0.08)
+        ax.set_xlim(min(all_x) - pad, max(all_x) + pad)
+        ax.set_ylim(min(all_y) - pad, max(all_y) + pad)
+        ax.set_zlim(min(all_z) - pad, max(all_z) + pad)
+
+        # ── Info box ──────────────────────────────────────────────────────────
+        cov_str = f"{ekfs[-1].cov_trace:.3e}" if ekfs else "—"
+        err_str = f"{pos_error_m:.2f} m" if not math.isnan(pos_error_m) else "—"
+        t_pos = f"({truths[-1].x:+.1f}, {truths[-1].y:+.1f}, {truths[-1].z:+.1f})" if truths else "—"
+        e_pos = f"({ekfs[-1].x:+.1f}, {ekfs[-1].y:+.1f}, {ekfs[-1].z:+.1f})"       if ekfs  else "—"
+
         info_text.set_text(
-            f"t = {last.timestamp:.3f} s\n"
-            f"pos  ({last.pos_x:+.2f}, {last.pos_y:+.2f}, {last.pos_z:+.2f}) m\n"
-            f"vel  ({last.vel_x:+.2f}, {last.vel_y:+.2f}, {last.vel_z:+.2f}) m/s\n"
-            f"cov trace  {cov_trace:.3e}\n"
-            f"history  {len(states)} / {VIZ_HISTORY}"
+            f"  Truth pos  {t_pos} m\n"
+            f"  EKF pos    {e_pos} m\n"
+            f"  ─────────────────────────────\n"
+            f"  Position error  {err_str}\n"
+            f"  Cov trace       {cov_str}\n"
+            f"  Truth pts  {len(truths)}   EKF pts  {len(ekfs)}"
         )
 
-        return trail_line, current_dot, info_text
+        return truth_trail, truth_dot, ekf_trail, ekf_dot, error_line, info_text
 
     ani = animation.FuncAnimation(  # noqa: F841 — must stay alive
         fig,
