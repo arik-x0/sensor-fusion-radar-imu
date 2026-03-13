@@ -1,0 +1,102 @@
+services:
+  # ── Broker (central message router — start first) ─────────────────────────
+  broker_service:
+    build:
+      context: .
+      dockerfile: services/broker/Dockerfile
+    container_name: broker_service
+    environment:
+      BROKER_XSUB_ADDR: "tcp://*:5550"
+      BROKER_XPUB_ADDR: "tcp://*:5551"
+      BROKER_ROUTER_ADDR: "tcp://*:5552"
+    networks:
+      - sensor_net
+
+  # ── Radar Simulator ────────────────────────────────────────────────────────
+  radar_service:
+    build:
+      context: .
+      dockerfile: services/radar_service/Dockerfile
+    container_name: radar_service
+    depends_on:
+      - broker_service
+    environment:
+      BROKER_XSUB_ADDR: "tcp://broker_service:5550"
+      RADAR_HZ: "${RADAR_HZ:-10}"
+      RADAR_NOISE_RANGE: "${RADAR_NOISE_RANGE:-1.5}"
+      RADAR_NOISE_ANGLE: "${RADAR_NOISE_ANGLE:-0.01}"
+      RADAR_NOISE_DOPPLER: "${RADAR_NOISE_DOPPLER:-0.5}"
+    networks:
+      - sensor_net
+
+  # ── IMU Simulator ──────────────────────────────────────────────────────────
+  imu_service:
+    build:
+      context: .
+      dockerfile: services/imu_service/Dockerfile
+    container_name: imu_service
+    depends_on:
+      - broker_service
+    environment:
+      BROKER_XSUB_ADDR: "tcp://broker_service:5550"
+      IMU_HZ: "${IMU_HZ:-100}"
+      IMU_NOISE_ACCEL: "${IMU_NOISE_ACCEL:-0.05}"
+      IMU_NOISE_GYRO: "${IMU_NOISE_GYRO:-0.005}"
+    networks:
+      - sensor_net
+
+  # ── Buffer Service (sync + reorder sensor streams) ────────────────────────
+  buffer_service:
+    build:
+      context: .
+      dockerfile: services/buffer_service/Dockerfile
+    container_name: buffer_service
+    depends_on:
+      - broker_service
+      - radar_service
+      - imu_service
+    environment:
+      BROKER_XPUB_ADDR: "tcp://broker_service:5551"
+      BROKER_XSUB_ADDR: "tcp://broker_service:5550"
+      BUFFER_WINDOW_MS: "${BUFFER_WINDOW_MS:-100}"
+      BUFFER_MAX_AGE_S: "${BUFFER_MAX_AGE_S:-5.0}"
+    networks:
+      - sensor_net
+
+  # ── EKF Service (main fusion) ─────────────────────────────────────────────
+  ekf_service:
+    build:
+      context: .
+      dockerfile: services/ekf_service/Dockerfile
+    container_name: ekf_service
+    depends_on:
+      - broker_service
+      - buffer_service
+    environment:
+      BROKER_XPUB_ADDR: "tcp://broker_service:5551"
+      BROKER_XSUB_ADDR: "tcp://broker_service:5550"
+      EKF_SIGMA_ACCEL: "${EKF_SIGMA_ACCEL:-0.1}"
+      EKF_SIGMA_GYRO: "${EKF_SIGMA_GYRO:-0.01}"
+      EKF_SIGMA_RANGE: "${EKF_SIGMA_RANGE:-2.0}"
+      EKF_SIGMA_ANGLE: "${EKF_SIGMA_ANGLE:-0.02}"
+      EKF_SIGMA_DOPPLER: "${EKF_SIGMA_DOPPLER:-0.5}"
+    networks:
+      - sensor_net
+
+  # ── Monitor / Display ─────────────────────────────────────────────────────
+  monitor_service:
+    build:
+      context: .
+      dockerfile: services/monitor_service/Dockerfile
+    container_name: monitor_service
+    depends_on:
+      - broker_service
+      - ekf_service
+    environment:
+      BROKER_XPUB_ADDR: "tcp://broker_service:5551"
+    networks:
+      - sensor_net
+
+networks:
+  sensor_net:
+    driver: bridge
