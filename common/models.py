@@ -18,6 +18,60 @@ import msgpack
 
 
 # ---------------------------------------------------------------------------
+# Rover Ground Truth  (rover_service → radar_service, imu_service)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RoverTruth:
+    """True rover state published by the rover simulator.
+
+    Both radar_service and imu_service subscribe to this topic and derive
+    their respective noisy measurements from it, ensuring both sensors always
+    observe the same physical rover.
+
+    Accelerations are the rover's true kinematic (inertial) accelerations in
+    the world frame — gravity is NOT included.  The IMU service converts
+    these to body-frame specific force before adding sensor noise.
+    """
+    timestamp: float            # seconds since epoch
+
+    # World-frame position (m)
+    pos_x: float
+    pos_y: float
+    pos_z: float
+
+    # World-frame velocity (m/s)
+    vel_x: float
+    vel_y: float
+    vel_z: float
+
+    # World-frame kinematic acceleration (m/s²)  — gravity excluded
+    accel_world_x: float
+    accel_world_y: float
+    accel_world_z: float
+
+    # Rover body orientation as a unit quaternion (w, x, y, z)
+    # Encodes the rotation from body frame to world frame.
+    qw: float
+    qx: float
+    qy: float
+    qz: float
+
+    # Body-frame angular rate (rad/s) — what the gyroscope measures (truth)
+    gyro_x: float
+    gyro_y: float
+    gyro_z: float
+
+    def to_bytes(self) -> bytes:
+        return msgpack.packb(asdict(self), use_bin_type=True)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RoverTruth":
+        d = msgpack.unpackb(data, raw=False)
+        return cls(**d)
+
+
+# ---------------------------------------------------------------------------
 # IMU Measurement
 # ---------------------------------------------------------------------------
 
