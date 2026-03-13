@@ -1,0 +1,4 @@
+pyzmq==26.2.0
+msgpack==1.1.0
+numpy==1.26.4
+matplotlib==3.9.2

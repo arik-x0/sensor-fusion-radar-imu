@@ -12,24 +12,28 @@ XSUB/XPUB sockets. A dedicated **buffer service** sits between the raw sensors
 and the EKF to synchronize the two streams and detect late-arriving messages.
 
 ```
-┌─────────────────┐                                      ┌─────────────────┐
-│  radar_service  │──PUB (topic: radar)──▶┐              │ monitor_service  │
-│  10 Hz          │                       │              │ prints state     │
-└─────────────────┘                       ▼              └────────▲────────┘
-                                  ┌───────────────┐               │
-┌─────────────────┐               │               │               │
-│  imu_service    │──PUB (imu)──▶ │ broker_service│──XPUB──▶──────┤
-│  100 Hz         │               │  XSUB / XPUB  │               │
-└─────────────────┘               │  ROUTER       │          ┌────┴────────────────┐
-                                  └───────────────┘          │   ekf_service       │
-                                          │                  │                     │
-                                    XPUB  │                  │  predict()  (IMU)   │
-                                          ▼                  │  update()   (Radar) │
-                                  ┌───────────────┐          │  backprop on late   │
-                                  │ buffer_service│──buffer──▶  messages           │
-                                  │  sync + order │          └─────────────────────┘
-                                  │  late detect  │
-                                  └───────────────┘
+┌─────────────────┐                                      ┌──────────────────────┐
+│  radar_service  │──PUB (topic: radar)──▶┐              │   monitor_service    │
+│  10 Hz          │                       │              │   prints state       │
+└─────────────────┘                       ▼              └──────────▲───────────┘
+                                  ┌───────────────┐                 │
+┌─────────────────┐               │               │                 │
+│  imu_service    │──PUB (imu)──▶ │ broker_service│──XPUB──▶────────┤
+│  100 Hz         │               │  XSUB / XPUB  │                 │
+└─────────────────┘               │  ROUTER       │            ┌────┴──────────────────┐
+                                  └───────────────┘            │    ekf_service        │
+                                          │                    │                       │
+                                    XPUB  │                    │  predict()  (IMU)     │
+                                          ▼                    │  update()   (Radar)   │
+                                  ┌───────────────┐            │  backprop on late     │
+                                  │ buffer_service│──buffer──▶ │  messages             │
+                                  │  sync + order │            └───────────┬───────────┘
+                                  │  late detect  │                        │ PUB (state)
+                                  └───────────────┘                        ▼
+                                                               ┌──────────────────────┐
+                                                               │  visualizer_service  │
+                                                               │  live 3-D plot       │
+                                                               └──────────────────────┘
 ```
 
 ### Services
@@ -42,6 +46,7 @@ and the EKF to synchronize the two streams and detect late-arriving messages.
 | `buffer_service` | Buffers and time-orders both sensor streams; flags late messages for backpropagation |
 | `ekf_service` | **Main service** — runs EKF predict/update, publishes `EkfState`; performs backpropagation on late data |
 | `monitor_service` | Subscribes to EKF state, pretty-prints position/velocity/attitude and covariance trace |
+| `visualizer_service` | Subscribes to EKF state, renders a live 3-D matplotlib trajectory plot (local only — requires a display) |
 
 ### Broker Ports
 
@@ -68,7 +73,8 @@ and the EKF to synchronize the two streams and detect late-arriving messages.
 3. If a message arrives after messages with a later timestamp have already been released, `BufferEntry.is_late` is set to `True`.
 4. **ekf_service** subscribes only to `TOPIC_BUFFER`. It dispatches each entry to `ekf.predict()` (IMU) or `ekf.update()` (radar) and publishes the fused `EkfState` after every radar update.
 5. On `is_late=True`, the EKF rewinds to the stored state snapshot just before the late measurement's timestamp, inserts the late measurement, and replays all subsequent measurements from its internal history buffer (backpropagation).
-6. **monitor_service** subscribes to the fused state and prints it.
+6. **monitor_service** subscribes to the fused state and pretty-prints it to stdout.
+7. **visualizer_service** (optional, local only) subscribes to the same state topic and renders a live 3-D matplotlib trajectory plot.
 
 ---
 
@@ -96,7 +102,7 @@ Run each service in a separate terminal. Start the broker first.
 
 ```bash
 # Install dependencies
-pip install pyzmq msgpack numpy
+pip install pyzmq msgpack numpy matplotlib
 
 # Set PYTHONPATH so imports resolve
 set PYTHONPATH=.          # Windows
@@ -117,6 +123,9 @@ python services/ekf_service/ekf_node.py
 
 # 5 — Monitor
 python services/monitor_service/monitor_node.py
+
+# 6 — 3-D Visualizer (optional, local only — opens a matplotlib window)
+python services/visualizer_service/visualizer_node.py
 ```
 
 When running locally, override the default broker address if needed:
@@ -148,6 +157,8 @@ All parameters are controlled via environment variables (see `.env`).
 | `EKF_SIGMA_RANGE` | `2.0` | EKF measurement noise — range |
 | `EKF_SIGMA_ANGLE` | `0.02` | EKF measurement noise — angles |
 | `EKF_SIGMA_DOPPLER` | `0.5` | EKF measurement noise — Doppler |
+| `VIZ_HISTORY` | `500` | Visualizer — number of past positions kept in the 3-D trail |
+| `VIZ_UPDATE_MS` | `100` | Visualizer — plot refresh interval (ms) |
 
 ---
 
@@ -202,9 +213,13 @@ sensor-fusion-radar-imu/
 │   │   └── tests/
 │   │       └── test_ekf_core.py
 │   │
-│   └── monitor_service/
-│       ├── monitor_node.py        # State display — subscribes via broker
-│       ├── Dockerfile
+│   ├── monitor_service/
+│   │   ├── monitor_node.py        # State display — subscribes via broker
+│   │   ├── Dockerfile
+│   │   └── requirements.txt
+│   │
+│   └── visualizer_service/
+│       ├── visualizer_node.py     # Live 3-D matplotlib trajectory plot (local only)
 │       └── requirements.txt
 │
 ├── docker-compose.yml
