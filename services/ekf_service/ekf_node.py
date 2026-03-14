@@ -29,11 +29,14 @@ BROKER_XPUB_ADDR   ZMQ connect address for broker XPUB  (default tcp://broker_se
 BROKER_XSUB_ADDR   ZMQ connect address for broker XSUB  (default tcp://broker_service:5550)
 
 EKF noise parameters (all floats):
-  EKF_SIGMA_ACCEL      accelerometer noise std-dev (m/s²)  default 0.1
-  EKF_SIGMA_GYRO       gyro noise std-dev (rad/s)           default 0.01
-  EKF_SIGMA_RANGE      radar range noise (m)                default 2.0
-  EKF_SIGMA_ANGLE      radar angle noise (rad)              default 0.02
-  EKF_SIGMA_DOPPLER    radar Doppler noise (m/s)            default 0.5
+  EKF_SIGMA_ACCEL      accelerometer noise std-dev (m/s²)       default 0.1
+  EKF_SIGMA_GYRO       gyro noise std-dev (rad/s)               default 0.01
+  EKF_SIGMA_RANGE      radar range noise (m)                    default 2.0
+  EKF_SIGMA_ANGLE      radar angle noise (rad)                  default 0.02
+  EKF_SIGMA_DOPPLER    radar Doppler noise (m/s)                default 0.5
+  EKF_SIGMA_ABIAS_RW   accel bias random-walk noise (m/s²/√s)  default 1e-4
+  EKF_SIGMA_GBIAS_RW   gyro bias random-walk noise (rad/s/√s)  default 1e-5
+  EKF_INNOV_GATE       innovation gate (normalised y²/S)        default 5.0
 """
 
 from __future__ import annotations
@@ -60,6 +63,9 @@ EKF_SIGMA_GYRO    = float(os.getenv("EKF_SIGMA_GYRO",    "0.01"))
 EKF_SIGMA_RANGE   = float(os.getenv("EKF_SIGMA_RANGE",   "2.0"))
 EKF_SIGMA_ANGLE   = float(os.getenv("EKF_SIGMA_ANGLE",   "0.02"))
 EKF_SIGMA_DOPPLER = float(os.getenv("EKF_SIGMA_DOPPLER", "0.5"))
+EKF_SIGMA_ABIAS_RW = float(os.getenv("EKF_SIGMA_ABIAS_RW", "1e-4"))
+EKF_SIGMA_GBIAS_RW = float(os.getenv("EKF_SIGMA_GBIAS_RW", "1e-5"))
+EKF_INNOV_GATE     = float(os.getenv("EKF_INNOV_GATE",     "5.0"))
 
 # Number of state snapshots to keep (≈ 20 s of radar updates at 10 Hz)
 MAX_SNAPSHOTS = 200
@@ -111,6 +117,9 @@ class EkfServiceNode:
             sigma_range=EKF_SIGMA_RANGE,
             sigma_angle=EKF_SIGMA_ANGLE,
             sigma_doppler=EKF_SIGMA_DOPPLER,
+            sigma_abias_rw=EKF_SIGMA_ABIAS_RW,
+            sigma_gbias_rw=EKF_SIGMA_GBIAS_RW,
+            innov_gate=EKF_INNOV_GATE,
         )
         # Circular snapshot buffer (indexed by radar updates)
         self._snapshots: collections.deque[_Snapshot] = collections.deque(
